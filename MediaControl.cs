@@ -1,24 +1,26 @@
-﻿using System;
-using System.Runtime.InteropServices;
-using System.Collections.Generic;
-using Windows.Media;
-using Windows.Media.Core;
-using Windows.Media.Playback;
-using Windows.Storage;
-using Windows.Storage.Streams;
+using System;
+using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
-using static System.IO.WindowsRuntimeStreamExtensions;
+using Windows.Media;
+using Windows.Media.Playback;
+using Windows.Storage.Streams;
+using static System.UInt32;
 
 namespace MusicBeePlugin
 {
     public partial class Plugin
     {
-        private MusicBeeApiInterface mbApiInterface;
+        private const int PreviousDelay = 3000; // ms 
         private readonly PluginInfo about = new PluginInfo();
-        private SystemMediaTransportControls systemMediaControls;
-        private SystemMediaTransportControlsDisplayUpdater displayUpdater;
-        private MusicDisplayProperties musicProperties;
+
+        private readonly object commandLock = new object();
         private InMemoryRandomAccessStream artworkStream;
+        private SystemMediaTransportControlsDisplayUpdater displayUpdater;
+        private DateTime lastPrevious;
+        private MusicBeeApiInterface mbApiInterface;
+        private MediaPlayer mediaPlayer;
+        private MusicDisplayProperties musicProperties;
+        private SystemMediaTransportControls systemMediaControls;
 
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
@@ -28,15 +30,16 @@ namespace MusicBeePlugin
             about.Name = "Media Control";
             about.Description = "Enables MusicBee to interact with the Windows 10 Media Control overlay.";
             about.Author = "Ameer Dawood";
-            about.TargetApplication = "";   //  the name of a Plugin Storage device or panel header for a dockable panel
+            about.TargetApplication = ""; //  the name of a Plugin Storage device or panel header for a dockable panel
             about.Type = PluginType.General;
-            about.VersionMajor = 1;  // your plugin version
+            about.VersionMajor = 1; // your plugin version
             about.VersionMinor = 0;
-            about.Revision = 1;
+            about.Revision = 2;
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
             about.ReceiveNotifications = ReceiveNotificationFlags.PlayerEvents;
-            about.ConfigurationPanelHeight = 0;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+            about.ConfigurationPanelHeight =
+                0; // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
             return about;
         }
 
@@ -44,7 +47,7 @@ namespace MusicBeePlugin
         {
             return false;
         }
-       
+
         // called by MusicBee when the user clicks Apply or Save in the MusicBee Preferences screen.
         // its up to you to figure out whether anything has changed and needs updating
         public void SaveSettings()
@@ -54,7 +57,7 @@ namespace MusicBeePlugin
         // MusicBee is closing the plugin (plugin is being disabled by user or MusicBee is shutting down)
         public void Close(PluginCloseReason reason)
         {
-            SetArtworkThumbnail(null);
+            systemMediaControls.IsEnabled = false;
         }
 
         // uninstall this plugin - clean up any persisted files
@@ -68,80 +71,131 @@ namespace MusicBeePlugin
         {
             switch (type)
             {
-                case NotificationType.PluginStartup:
-                    systemMediaControls = BackgroundMediaPlayer.Current.SystemMediaTransportControls;
-                    systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Closed;
-                    systemMediaControls.IsEnabled = false;
-                    systemMediaControls.IsPlayEnabled = true;
-                    systemMediaControls.IsPauseEnabled = true;
-                    systemMediaControls.IsStopEnabled = true;
-                    systemMediaControls.IsPreviousEnabled = true;
-                    systemMediaControls.IsNextEnabled = true;
-                    systemMediaControls.IsRewindEnabled = false;
-                    systemMediaControls.IsFastForwardEnabled = false;
-                    systemMediaControls.ButtonPressed += systemMediaControls_ButtonPressed;
-                    systemMediaControls.PlaybackPositionChangeRequested += systemMediaControls_PlaybackPositionChangeRequested;
-                    systemMediaControls.PlaybackRateChangeRequested += systemMediaControls_PlaybackRateChangeRequested;
-                    systemMediaControls.ShuffleEnabledChangeRequested += systemMediaControls_ShuffleEnabledChangeRequested;
-                    systemMediaControls.AutoRepeatModeChangeRequested += systemMediaControls_AutoRepeatModeChangeRequested;
-                    displayUpdater = systemMediaControls.DisplayUpdater;
-                    displayUpdater.Type = MediaPlaybackType.Music;
-                    musicProperties = displayUpdater.MusicProperties;
-                    SetDisplayValues();
-                    break;
-                case NotificationType.PlayStateChanged:
-                    SetPlayerState();
-                    break;
                 case NotificationType.TrackChanged:
                     SetDisplayValues();
                     break;
+                case NotificationType.TrackChanging:
+                case NotificationType.PlayStateChanged:
+                    SetPlayerState();
+                    break;
+
+                // Only on StartUp
+                case NotificationType.PluginStartup:
+                    PluginStartUp();
+                    break;
             }
         }
 
-        private void systemMediaControls_ButtonPressed(SystemMediaTransportControls smtc, SystemMediaTransportControlsButtonPressedEventArgs args)
+        private void PluginStartUp()
         {
-            switch (args.Button)
+            // set up media player to get manual control of SystemMediaTransportControls
+            mediaPlayer = new MediaPlayer();
+            mediaPlayer.CommandManager.IsEnabled = false;
+
+            // set up SystemMediaTransportControls
+            systemMediaControls = mediaPlayer.SystemMediaTransportControls;
+            // set flags
+            systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Closed; // nothing in list to play
+            systemMediaControls.IsEnabled = true; // show it
+            systemMediaControls.IsPlayEnabled = true;
+            systemMediaControls.IsPauseEnabled = true;
+            systemMediaControls.IsStopEnabled = true;
+            systemMediaControls.IsPreviousEnabled = true;
+            systemMediaControls.IsNextEnabled = true;
+            systemMediaControls.IsRewindEnabled = true;
+            systemMediaControls.IsFastForwardEnabled = false;
+
+            // Sync musicbee volume with Windows volume
+            //mbApiInterface.Player_SetVolume() = systemMediaControls.SoundLevel
+
+            systemMediaControls.ButtonPressed += systemMediaControls_ButtonPressed;
+            systemMediaControls.PlaybackPositionChangeRequested +=
+                systemMediaControls_PlaybackPositionChangeRequested;
+            systemMediaControls.PlaybackRateChangeRequested += systemMediaControls_PlaybackRateChangeRequested;
+            systemMediaControls.ShuffleEnabledChangeRequested +=
+                systemMediaControls_ShuffleEnabledChangeRequested;
+            systemMediaControls.AutoRepeatModeChangeRequested +=
+                systemMediaControls_AutoRepeatModeChangeRequested;
+
+            // setup overlay properties
+            displayUpdater = systemMediaControls.DisplayUpdater;
+            displayUpdater.Type = MediaPlaybackType.Music; // media type
+            displayUpdater.AppMediaId = "MusicBee"; // program name
+            // setup for display music properties on overlay
+            musicProperties = displayUpdater.MusicProperties;
+            SetDisplayValues();
+        }
+
+        private void systemMediaControls_ButtonPressed(SystemMediaTransportControls smtc,
+            SystemMediaTransportControlsButtonPressedEventArgs args)
+        {
+            lock (commandLock)
             {
-                case SystemMediaTransportControlsButton.Stop:
-                    mbApiInterface.Player_Stop();
-                    break;
-                case SystemMediaTransportControlsButton.Play:
-                    if (mbApiInterface.Player_GetPlayState() != PlayState.Playing)
-                       mbApiInterface.Player_PlayPause();
-                    break;
-                case SystemMediaTransportControlsButton.Pause:
-                    if (mbApiInterface.Player_GetPlayState() != PlayState.Paused)
-                        mbApiInterface.Player_PlayPause();
-                    break;
-                case SystemMediaTransportControlsButton.Next:
-                    mbApiInterface.Player_PlayNextTrack();
-                    break;
-                case SystemMediaTransportControlsButton.Previous:
-                    mbApiInterface.Player_PlayPreviousTrack();
-                    break;
-                case SystemMediaTransportControlsButton.Rewind:
-                    break;
-                case SystemMediaTransportControlsButton.FastForward:
-                    break;
-                case SystemMediaTransportControlsButton.ChannelUp:
-                    mbApiInterface.Player_SetVolume(mbApiInterface.Player_GetVolume() + 0.05F);
-                    break;
-                case SystemMediaTransportControlsButton.ChannelDown:
-                    mbApiInterface.Player_SetVolume(mbApiInterface.Player_GetVolume() - 0.05F);
-                    break;
+                switch (args.Button)
+                {
+                    case SystemMediaTransportControlsButton.Play:
+                    case SystemMediaTransportControlsButton.Pause:
+
+                        if (systemMediaControls.PlaybackStatus != MediaPlaybackStatus.Changing)
+                            mbApiInterface.Player_PlayPause();
+
+                        break;
+                    case SystemMediaTransportControlsButton.Stop:
+                        mbApiInterface.Player_Stop();
+                        break;
+                    case SystemMediaTransportControlsButton.Next:
+                        mbApiInterface.Player_PlayNextTrack();
+                        break;
+                    case SystemMediaTransportControlsButton.Rewind:
+                    case SystemMediaTransportControlsButton.Previous:
+                        if (systemMediaControls.PlaybackStatus != MediaPlaybackStatus.Changing)
+                        {
+                            // restart song
+                            if (DateTime.Now.Subtract(lastPrevious).TotalMilliseconds > PreviousDelay)
+                            {
+                                mbApiInterface.Player_Stop();
+                                mbApiInterface.Player_PlayPause();
+                                lastPrevious = DateTime.Now;
+                                break;
+                            }
+
+                            // play previous track
+                            if (DateTime.Now.Subtract(lastPrevious).TotalMilliseconds < PreviousDelay)
+                            {
+                                mbApiInterface.Player_Stop();
+                                mbApiInterface.Player_PlayPreviousTrack();
+                                lastPrevious = DateTime.Now;
+                            }
+                        }
+
+                        break;
+                    // TODO: fix
+                    case SystemMediaTransportControlsButton.ChannelUp:
+                        mbApiInterface.Player_SetVolume(mbApiInterface.Player_GetVolume() + 0.05F);
+                        break;
+                    case SystemMediaTransportControlsButton.ChannelDown:
+                        mbApiInterface.Player_SetVolume(mbApiInterface.Player_GetVolume() - 0.05F);
+                        break;
+                }
             }
         }
 
-        private void systemMediaControls_PlaybackPositionChangeRequested(SystemMediaTransportControls smtc, PlaybackPositionChangeRequestedEventArgs args)
+        private void systemMediaControls_PlaybackPositionChangeRequested(
+            SystemMediaTransportControls systemMediaTransportControls,
+            PlaybackPositionChangeRequestedEventArgs args)
         {
             mbApiInterface.Player_SetPosition(args.RequestedPlaybackPosition.Milliseconds);
         }
 
-        private void systemMediaControls_PlaybackRateChangeRequested(SystemMediaTransportControls smtc, PlaybackRateChangeRequestedEventArgs args)
+        private static void systemMediaControls_PlaybackRateChangeRequested(
+            SystemMediaTransportControls systemMediaTransportControls,
+            PlaybackRateChangeRequestedEventArgs args)
         {
         }
 
-        private void systemMediaControls_AutoRepeatModeChangeRequested(SystemMediaTransportControls smtc, AutoRepeatModeChangeRequestedEventArgs args)
+        private void systemMediaControls_AutoRepeatModeChangeRequested(
+            SystemMediaTransportControls systemMediaTransportControls,
+            AutoRepeatModeChangeRequestedEventArgs args)
         {
             switch (args.RequestedAutoRepeatMode)
             {
@@ -157,55 +211,68 @@ namespace MusicBeePlugin
             }
         }
 
-        private void systemMediaControls_ShuffleEnabledChangeRequested(SystemMediaTransportControls smtc, ShuffleEnabledChangeRequestedEventArgs args)
+        private void systemMediaControls_ShuffleEnabledChangeRequested(
+            SystemMediaTransportControls systemMediaTransportControls,
+            ShuffleEnabledChangeRequestedEventArgs args)
         {
             mbApiInterface.Player_SetShuffle(args.RequestedShuffleEnabled);
         }
 
         private void SetDisplayValues()
         {
-            displayUpdater.ClearAll();
-            displayUpdater.Type = MediaPlaybackType.Music;
-            SetArtworkThumbnail(null);
-            string url = mbApiInterface.NowPlaying_GetFileUrl();
+            // displayUpdater.ClearAll();
+            if (displayUpdater.Type != MediaPlaybackType.Music) displayUpdater.Type = MediaPlaybackType.Music;
+            // SetArtworkThumbnail(null);
+            var url = mbApiInterface.NowPlaying_GetFileUrl();
             if (url != null)
             {
                 musicProperties.AlbumArtist = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.AlbumArtist);
                 musicProperties.AlbumTitle = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album);
-                uint value;
-                if (UInt32.TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackCount), out value))
+
+                if (TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackCount), out var value))
                     musicProperties.AlbumTrackCount = value;
-                musicProperties.Artist = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist);
+
+                musicProperties.Artist = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.MultiArtist);
                 musicProperties.Title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle);
+
                 if (string.IsNullOrEmpty(musicProperties.Title))
-                    musicProperties.Title = url.Substring(url.LastIndexOfAny(new char[] { '/', '\\' }) + 1);
-                if (UInt32.TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackNo), out value))
+                    musicProperties.Title = url.Substring(url.LastIndexOfAny(new[] {'/', '\\'}) + 1);
+
+                if (TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackNo), out value))
                     musicProperties.TrackNumber = value;
-                //musicProperties.Genres = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Genres).Split(new string[] {"; "}, StringSplitOptions.RemoveEmptyEntries);
-                PictureLocations pictureLocations;
-                string pictureUrl;
-                byte[] imageData;
-                mbApiInterface.Library_GetArtworkEx(url, 0, true, out pictureLocations, out pictureUrl, out imageData);
+                // musicProperties.Genres = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Genres).Split(new string[] {"; "}, StringSplitOptions.RemoveEmptyEntries);
+                mbApiInterface.Library_GetArtworkEx(url, 0, true, out _, out _, out var imageData);
                 SetArtworkThumbnail(imageData);
             }
+            else
+            {
+                SetArtworkThumbnail(null);
+            }
+
             displayUpdater.Update();
         }
 
         private void SetPlayerState()
         {
-
             switch (mbApiInterface.Player_GetPlayState())
             {
                 case PlayState.Playing:
                     systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Playing;
-                    systemMediaControls.IsEnabled = true;
+                    if (!systemMediaControls.IsEnabled)
+                        systemMediaControls.IsEnabled = true;
                     break;
                 case PlayState.Paused:
                     systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Paused;
                     break;
-                case PlayState.Stopped:
+                case PlayState.Undefined:
                     systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Stopped;
                     systemMediaControls.IsEnabled = false;
+                    break;
+                case PlayState.Loading:
+                    systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Changing;
+                    break;
+                case PlayState.Stopped:
+                    systemMediaControls.PlaybackStatus = MediaPlaybackStatus.Stopped;
                     break;
             }
         }
@@ -221,11 +288,13 @@ namespace MusicBeePlugin
             }
             else
             {
+                new MemoryStream(data).AsInputStream();
+
                 artworkStream = new InMemoryRandomAccessStream();
                 await artworkStream.WriteAsync(data.AsBuffer());
+                displayUpdater.Thumbnail = RandomAccessStreamReference.CreateFromStream(artworkStream);
                 displayUpdater.Thumbnail = RandomAccessStreamReference.CreateFromStream(artworkStream);
             }
         }
     }
-
 }
