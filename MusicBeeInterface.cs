@@ -812,8 +812,8 @@ namespace MusicBeePlugin
         }
 
         public const short PluginInfoVersion = 1;
-        public const short MinInterfaceVersion = 36;
-        public const short MinApiRevision = 48;
+        public const short MinInterfaceVersion = 41;
+        public const short MinApiRevision = 53;
 
         [SuppressUnmanagedCodeSecurity]
         [DllImport("kernel32.dll")]

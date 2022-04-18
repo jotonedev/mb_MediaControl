@@ -236,7 +236,7 @@ namespace MusicBeePlugin
                 musicProperties.Title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle);
 
                 if (string.IsNullOrEmpty(musicProperties.Title))
-                    musicProperties.Title = url.Substring(url.LastIndexOfAny(new[] {'/', '\\'}) + 1);
+                    musicProperties.Title = url.Substring(url.LastIndexOfAny(new[] { '/', '\\' }) + 1);
 
                 if (TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackNo), out value))
                     musicProperties.TrackNumber = value;
